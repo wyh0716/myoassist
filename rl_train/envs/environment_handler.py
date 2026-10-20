@@ -101,15 +101,15 @@ class EnvironmentHandler:
         device_key = config.env_params.device_key
         model_path = config.env_params.model_path
 
-        # Compose takes both keys or neither. Half a spec used to fall through to
-        # model_path, which is None in every migrated config, and failed inside
-        # gym.make without mentioning the key that was actually missing.
-        if bool(msk_key) != bool(device_key):
-            missing, present = ("device_key", f"msk_key={msk_key!r}") if msk_key else ("msk_key", f"device_key={device_key!r}")
+        # A device is optional for a human-only run.  ``msk_key`` by itself is
+        # intentionally routed through ``compose_msk_model`` instead of using a
+        # passive/zero-command device: that path creates the bare MSK model, so
+        # no device bodies, masses, joints, constraints or actuators enter the
+        # MuJoCo dynamics.  A device without an MSK remains invalid.
+        if device_key and not msk_key:
             raise ValueError(
-                f"Incomplete compose spec: {present} is set but {missing} is not. Set both to "
-                f"compose a model (run `python -m assist_sim list` for the valid keys), or "
-                f"neither and give an explicit model_path."
+                f"Incomplete compose spec: device_key={device_key!r} is set but msk_key is not. "
+                "Set msk_key as well, or clear both keys and provide an explicit model_path."
             )
 
         if msk_key and device_key:
@@ -125,11 +125,15 @@ class EnvironmentHandler:
                 .compose()
             )
             EnvironmentHandler._validate_action_layout(model_path, config)
+        elif msk_key:
+            from myoassist_utils.compose import compose_msk_model
+
+            model_path = compose_msk_model(msk_key, terrain=config.env_params.terrain)
+            EnvironmentHandler._validate_action_layout(model_path, config)
         elif not model_path:
             raise ValueError(
-                "No model specified: set msk_key + device_key to compose a model, or "
-                "model_path to load a pre-built MJCF. The shipped configs use the "
-                "compose keys; a config carrying neither is a migration oversight."
+                "No model specified: set msk_key (and optional device_key) to compose a model, "
+                "or model_path to load a pre-built MJCF."
             )
 
         # Base gym.make arguments
@@ -329,16 +333,16 @@ class EnvironmentHandler:
         """
         import mujoco
 
-        from myoassist_utils.compose import compose_env_model
+        from myoassist_utils.compose import compose_env_model, compose_msk_model
         from rl_train.train.policies.mirror import action_permutation, observation_permutation
 
-        model = mujoco.MjModel.from_xml_string(
-            compose_env_model(
-                config.env_params.msk_key,
-                config.env_params.device_key,
-                terrain=config.env_params.terrain,
-            )
+        composer = compose_env_model if config.env_params.device_key else compose_msk_model
+        compose_args = (
+            (config.env_params.msk_key, config.env_params.device_key)
+            if config.env_params.device_key
+            else (config.env_params.msk_key,)
         )
+        model = mujoco.MjModel.from_xml_string(composer(*compose_args, terrain=config.env_params.terrain))
         n_muscle = int((model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE).sum())
         names = [model.actuator(i).name for i in range(model.nu)]
         act_perm = action_permutation(names)

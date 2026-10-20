@@ -1,11 +1,13 @@
 """Shared model compose + load pipeline for MyoAssist.
 
 ``compose_env_model(msk_key, device_key, terrain=None, export_path=None) -> str``
+``compose_msk_model(msk_key, terrain=None, export_path=None) -> str``
 
-Composes a human musculoskeletal model + assistive device (via ``assist_sim``)
-and merges a terrain scene (via ``myoassist_terrains``) into a single, loadable
-MJCF, returned as an XML *string*.  Both the RL and CO frameworks call this so
-they share one model/env build path.
+Composes either a human musculoskeletal model alone, or a human model +
+assistive device (via ``assist_sim``), then merges a terrain scene (via
+``myoassist_terrains``) into a single, loadable MJCF returned as an XML
+*string*.  Both the RL and CO frameworks call this so they share one model/env
+build path.
 
 The env consumes the returned string directly through myosuite's ``SimScene``
 (``"<mujoco"`` -> ``MjModel.from_xml_string``), so there is no temp file on the
@@ -33,7 +35,7 @@ from uuid import uuid4
 import mujoco as mj
 import numpy as np
 
-from assist_sim import load_combined
+from assist_sim import load_combined, load_msk
 from myoassist_terrains import build_terrain
 from myoassist_terrains.config import config_from_dict, load_config
 from myoassist_terrains.surface import TerrainSurface
@@ -389,6 +391,25 @@ def compose_env_model(
     return _compose_env_model(msk_key, device_key, terrain, export_path, planar_root)
 
 
+def compose_msk_model(
+    msk_key: str,
+    terrain: Optional[Union[str, Path, dict]] = None,
+    export_path: Optional[Union[str, Path]] = None,
+) -> str:
+    """Compose a device-free MSK model and terrain into a loadable MJCF string.
+
+    This is the human-only counterpart to :func:`compose_env_model`.  It delegates
+    the MSK build to ``assist_sim.load_msk`` so the model comes from the same
+    authoritative ``myo_sim`` registry and (for ``myolegs22``) the same 26-to-22
+    reduction used by device compositions.  No device XML is loaded or attached.
+
+    The terrain merge, rendering defaults, and ground-contact seating are shared
+    with the device path.  In particular, the flat default ground is still added
+    because ``load_msk`` deliberately exports an MSK-only model without a scene.
+    """
+    return _compose_msk_model(msk_key, terrain, export_path)
+
+
 def _compose_env_model_cached(
     msk_key: str,
     device_key: str,
@@ -454,14 +475,48 @@ def _compose_env_model(
     marks that directory as persistent (no exit-time cleanup). The cache passes
     its own so entries stay loadable in later processes.
     """
-    # 1) compose human + device -> reload-safe, model-only XML (scene stripped).
+    return _compose_model_with_terrain(
+        lambda model_xml_path: load_combined(
+            msk_key,
+            device_key,
+            export_xml=str(model_xml_path),
+            planar_root=planar_root,
+        ),
+        terrain,
+        export_path,
+        assets_dir,
+    )
+
+
+def _compose_msk_model(
+    msk_key: str,
+    terrain: Optional[Union[str, Path, dict]] = None,
+    export_path: Optional[Union[str, Path]] = None,
+) -> str:
+    """Uncached implementation for :func:`compose_msk_model`."""
+    return _compose_model_with_terrain(
+        lambda model_xml_path: load_msk(msk_key, export_xml=str(model_xml_path)),
+        terrain,
+        export_path,
+        assets_dir=None,
+    )
+
+
+def _compose_model_with_terrain(
+    export_model_only,
+    terrain: Optional[Union[str, Path, dict]],
+    export_path: Optional[Union[str, Path]],
+    assets_dir: Optional[Path],
+) -> str:
+    """Layer terrain and scene settings over a caller-supplied model-only export."""
+    # 1) export the model-only XML (scene stripped).
     model_dir = Path(tempfile.mkdtemp(prefix="myoassist_compose_"))
     # The immediate rmdir below only clears empty scratch dirs; register a
     # process-exit cleanup so any that still hold files (e.g. a terrain assets
     # dir the returned model references) are removed rather than leaked.
     atexit.register(shutil.rmtree, str(model_dir), ignore_errors=True)
     model_xml_path = model_dir / "model_only.xml"
-    load_combined(msk_key, device_key, export_xml=str(model_xml_path), planar_root=planar_root)
+    export_model_only(model_xml_path)
     model_root = ET.parse(model_xml_path).getroot()
     # meshes are written relative to the export dir -> resolve to the (absolute,
     # persistent) install location so the temp export dir can be removed.

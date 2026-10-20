@@ -145,7 +145,11 @@ class BaseCustomLearningCallback(BaseCallback):
             self.episode_reward_dict_sum = [{} for _ in range(self.training_env.num_envs)]
             self.current_reward_dict_sum = [{} for _ in range(self.training_env.num_envs)]
 
-        if self.log_count % self.evaluate_freq == 0 and self.log_count != 0:
+        # A non-positive frequency explicitly disables the heavyweight offline
+        # evaluator.  That evaluator renders a video and creates several plots in
+        # a child process; it is useful for a deliberate checkpoint inspection but
+        # should not stall a long-running PPO job at fixed rollout intervals.
+        if self.evaluate_freq > 0 and self.log_count % self.evaluate_freq == 0 and self.log_count != 0:
             # Create new pool each time to prevent memory leaks
 
             # For debug:
