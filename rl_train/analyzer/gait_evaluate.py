@@ -63,10 +63,14 @@ class GaitEvaluatorBase:
         max_target_velocity: float,
         terminate_when_done: bool,
         max_timestep: int = 600,
+        trained_model_path: str | None = None,
     ):
         # print(f"load from {self.train_log_handler.get_path2save_model(self.train_log_handler.log_datas[-1].num_timesteps)}")
         # Use get_stable_baselines3_model from EnvironmentHandler to load the model
-        trained_model_path = self.train_log_handler.get_path2save_model(self.train_log_handler.log_datas[-1].num_timesteps)
+        if trained_model_path is None:
+            trained_model_path = self.train_log_handler.get_path2save_model(
+                self.train_log_handler.log_datas[-1].num_timesteps
+            )
         model = EnvironmentHandler.get_stable_baselines3_model(
             self.session_config, self.env, trained_model_path=trained_model_path
         )

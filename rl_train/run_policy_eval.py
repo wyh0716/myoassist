@@ -36,6 +36,17 @@ def _parse_args():
     p.add_argument("--no-show", action="store_true", help="Skip the pop-out composite window.")
     p.add_argument("--regen", action="store_true", help="Regenerate evaluated gait data even if it already exists.")
     p.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Evaluate this exact PPO checkpoint (.zip) instead of the newest checkpoint in train_log.json.",
+    )
+    p.add_argument(
+        "--fixed-reference-start",
+        action="store_true",
+        help="Start the reference trajectory at index 0 for a repeatable full-length comparison.",
+    )
+    p.add_argument(
         "--varying",
         action="store_true",
         help="Override evaluate_param_list with a single SINUSOIDAL "
@@ -63,6 +74,8 @@ def _parse_args():
 def main():
     args = _parse_args()
     log_dir = args.log_dir or input("Enter the log directory: ")
+    if args.model_path is not None and not os.path.isfile(args.model_path):
+        raise FileNotFoundError(f"Checkpoint not found: {args.model_path}")
     show_composite = not args.no_show
 
     # Silence the noisy tight_layout warning emitted by some legacy panels.
@@ -81,6 +94,9 @@ def main():
     with open(os.path.join(log_dir, "session_config.json"), "r") as f:
         config_dict = json.load(f)
     config = DictionableDataclass.create(ImitationTrainSessionConfig, config_dict)
+    if args.fixed_reference_start:
+        config.env_params.flag_random_ref_index = False
+        print("  --fixed-reference-start: reference index 0")
 
     if args.varying:
         base = dict(config.evaluate_param_list[0]) if config.evaluate_param_list else {}
@@ -109,13 +125,23 @@ def main():
     print("RL Policy Evaluation")
     print("=" * 60)
     print(f"Log dir:       {log_dir}")
+    if args.model_path is not None:
+        print(f"Checkpoint:    {args.model_path}")
     print(f"Rollouts:      {len(config.evaluate_param_list)}")
     print(f"Composite:     enabled (show={show_composite})")
     print(f"Legacy plots:  {'enabled' if args.legacy_plots else 'disabled'}")
     print("=" * 60)
 
     for idx, evaluate_param in enumerate(config.evaluate_param_list):
-        analyze_result_dir = os.path.join(log_dir, f"analyze_results_{idx:02d}")
+        checkpoint_tag = os.path.splitext(os.path.basename(args.model_path))[0] if args.model_path else None
+        selected_timesteps = log_handler_timesteps = None
+        if checkpoint_tag is not None:
+            try:
+                selected_timesteps = int(checkpoint_tag.rsplit("_", 1)[-1])
+            except ValueError:
+                pass
+        result_name = f"analyze_results_{checkpoint_tag}_{idx:02d}" if checkpoint_tag else f"analyze_results_{idx:02d}"
+        analyze_result_dir = os.path.join(log_dir, result_name)
         os.makedirs(analyze_result_dir, exist_ok=True)
         print(f"\n[Rollout {idx + 1}/{len(config.evaluate_param_list)}] -> {analyze_result_dir}")
 
@@ -143,6 +169,7 @@ def main():
                     min_target_velocity=evaluate_param["min_target_velocity"],
                     max_target_velocity=evaluate_param["max_target_velocity"],
                     terminate_when_done=True,
+                    trained_model_path=args.model_path,
                 )
 
         gait_data = GaitData()
@@ -189,17 +216,27 @@ def main():
         except Exception as e:
             print(f"  Warning: snapshot render failed: {e}")
 
-        time_steps_curve = [d.num_timesteps for d in log_handler.log_datas]
-        returns_curve = [d.average_reward_per_episode for d in log_handler.log_datas]
+        curve_logs = log_handler.log_datas
+        if selected_timesteps is not None:
+            curve_logs = [d for d in curve_logs if d.num_timesteps <= selected_timesteps]
+        time_steps_curve = [d.num_timesteps for d in curve_logs]
+        returns_curve = [d.average_reward_per_episode for d in curve_logs]
+
+        log_handler_timesteps = log_handler.log_datas[-1].num_timesteps
+        reported_timesteps = selected_timesteps if selected_timesteps is not None else log_handler_timesteps
 
         metadata = {
-            "Model checkpoint": os.path.basename(log_handler.get_path2save_model(log_handler.log_datas[-1].num_timesteps)),
+            "Model checkpoint": os.path.basename(
+                args.model_path or log_handler.get_path2save_model(log_handler.log_datas[-1].num_timesteps)
+            ),
             "Env ID": config.env_params.env_id,
-            "Total timesteps": f"{log_handler.log_datas[-1].num_timesteps:,}",
+            "Total timesteps": f"{reported_timesteps:,}",
             "Eval timesteps": str(evaluate_param["num_timesteps"]),
             "Velocity mode": evaluate_param["velocity_mode"],
             "Target velocity": f"{evaluate_param['min_target_velocity']:.2f}–{evaluate_param['max_target_velocity']:.2f} m/s",
         }
+        if args.fixed_reference_start:
+            metadata["Reference start"] = "index 0 (fixed)"
 
         # Varying-speed rollout -> speed-aware composite (per-stride teal kinematics
         # + speed-tracking / cadence / step-length row).
