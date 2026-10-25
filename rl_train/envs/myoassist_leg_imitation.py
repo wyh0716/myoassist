@@ -144,10 +144,7 @@ class MyoAssistLegImitation(MyoAssistLegBase):
     def _get_qpos_diff(self) -> dict:
 
         def get_qpos_diff_one(key: str):
-            diff = (
-                self.sim.data.joint(f"{key}").qpos[0].copy()
-                - self._reference_data["series_data"][f"q_{key}"][self._imitation_index]
-            )
+            diff = self.sim.data.joint(f"{key}").qpos[0].copy() - self._reference_value(f"q_{key}")
             return diff
 
         name_diff_dict = {}
@@ -156,14 +153,12 @@ class MyoAssistLegImitation(MyoAssistLegBase):
         return name_diff_dict
 
     def _get_qvel_diff(self):
-        speed_ratio_to_target_velocity = (
-            self._target_velocity / self._reference_data["series_data"]["dq_pelvis_tx"][self._imitation_index]
-        )
+        speed_ratio_to_target_velocity = self._reference_speed_scale()
 
         def get_qvel_diff_one(key: str):
             diff = (
                 self.sim.data.joint(f"{key}").qvel[0].copy()
-                - self._reference_data["series_data"][f"dq_{key}"][self._imitation_index] * speed_ratio_to_target_velocity
+                - self._reference_value(f"dq_{key}") * speed_ratio_to_target_velocity
             )
             return diff
 
@@ -252,26 +247,22 @@ class MyoAssistLegImitation(MyoAssistLegBase):
 
     def _follow_reference_motion(self, is_x_follow: bool):
         for key in self.reference_data_keys:
-            self.sim.data.joint(f"{key}").qpos = self._reference_data["series_data"][f"q_{key}"][self._imitation_index]
+            self.sim.data.joint(f"{key}").qpos = self._reference_value(f"q_{key}")
             if not is_x_follow and key == "pelvis_tx":
                 self.sim.data.joint(f"{key}").qpos = 0
             # if key == 'pelvis_ty':
             #     self.sim.data.joint(f"{key}").qpos += 0.05
-        speed_ratio_to_target_velocity = (
-            self._target_velocity / self._reference_data["series_data"]["dq_pelvis_tx"][self._imitation_index]
-        )
+        speed_ratio_to_target_velocity = self._reference_speed_scale()
         for key in self.reference_data_keys:
             self.sim.data.joint(f"{key}").qvel = (
-                self._reference_data["series_data"][f"dq_{key}"][self._imitation_index] * speed_ratio_to_target_velocity
+                self._reference_value(f"dq_{key}") * speed_ratio_to_target_velocity
             )
 
     def imitation_step(self, is_x_follow: bool, specific_index: int | None = None):
         if specific_index is None:
-            self._imitation_index += 1
-            if self._imitation_index >= self._reference_data_length:
-                self._imitation_index = 0
+            self._advance_reference_phase(loop=True)
         else:
-            self._imitation_index = specific_index
+            self._set_reference_phase(float(specific_index))
         self._follow_reference_motion(is_x_follow)
         # should call this but I don't know why
         # next_obs, reward, terminated, truncated, info = super().step(np.zeros(self.sim.model.nu))
@@ -282,19 +273,14 @@ class MyoAssistLegImitation(MyoAssistLegBase):
 
     # override
     def step(self, a, **kwargs):
-        if self._imitation_index is not None:
-            self._imitation_index += 1
-            if self._imitation_index < self._reference_data_length:
-                is_out_of_index = False
-            else:
-                if self._loop_reference_data:
-                    self._imitation_index = 0
-                    is_out_of_index = False
-                else:
-                    is_out_of_index = True
-                    self._imitation_index = self._reference_data_length - 1
-        else:
-            is_out_of_index = True
+        # MyoSuite calls step once from its base _setup before any public reset.  That call is
+        # only a construction sanity check: do not advance the real trajectory or terminate a
+        # composed device because its authored initial pose differs from reference frame zero.
+        is_out_of_index = (
+            True
+            if not self._reference_phase_initialized
+            else self._advance_reference_phase(loop=self._loop_reference_data)
+        )
 
         next_obs, reward, terminated, truncated, info = super().step(a, **kwargs)
         if is_out_of_index:
@@ -311,8 +297,82 @@ class MyoAssistLegImitation(MyoAssistLegBase):
         if data is None:
             raise ValueError("Reference data is not set")
         self._reference_data = self._height_corrected_reference(data)
-        self._imitation_index = None
         self._reference_data_length = self._reference_data["metadata"]["resampled_data_length"]
+        # MyoSuite performs one validation step inside its base _setup before the first public
+        # reset.  Give that step a valid reference target; the real episode phase is selected by
+        # reset immediately afterwards.
+        self._imitation_index = 0
+        self._imitation_phase = 0.0
+        self._reference_phase_initialized = False
+        pelvis_velocity = np.asarray(self._reference_data["series_data"]["dq_pelvis_tx"], dtype=float)
+        self._reference_nominal_velocity = float(np.mean(pelvis_velocity))
+        if not np.isfinite(self._reference_nominal_velocity) or self._reference_nominal_velocity <= 0:
+            raise ValueError(
+                "Reference mean pelvis velocity must be finite and positive; "
+                f"got {self._reference_nominal_velocity}"
+            )
+
+    def _reference_speed_scale(self) -> float:
+        """Reference-time dilation needed for the current target walking speed."""
+        return float(self._target_velocity / self._reference_nominal_velocity)
+
+    def _set_reference_phase(self, phase: float):
+        last_index = self._reference_data_length - 1
+        self._imitation_phase = float(np.clip(phase, 0.0, last_index))
+        # Retain the integer index for existing analyzers and saved diagnostics.  Reward and
+        # reset state use the continuous phase, so no sub-frame timing information is lost.
+        self._imitation_index = int(np.floor(self._imitation_phase))
+
+    def _reference_value(self, key: str, phase: float | None = None) -> float:
+        if phase is None:
+            phase = self._imitation_phase
+        if phase is None:
+            raise RuntimeError("Reference phase has not been initialised")
+
+        values = self._reference_data["series_data"][key]
+        lower = int(np.floor(phase))
+        upper = min(lower + 1, self._reference_data_length - 1)
+        fraction = float(phase - lower)
+        return float((1.0 - fraction) * values[lower] + fraction * values[upper])
+
+    def _advance_reference_phase(self, *, loop: bool) -> bool:
+        """Advance by one control step; return whether a finite reference was exhausted."""
+        if self._imitation_phase is None:
+            return True
+
+        next_phase = self._imitation_phase + self._reference_speed_scale()
+        last_index = self._reference_data_length - 1
+        if next_phase <= last_index:
+            self._set_reference_phase(next_phase)
+            return False
+        if loop:
+            self._set_reference_phase(next_phase % self._reference_data_length)
+            return False
+
+        self._set_reference_phase(float(last_index))
+        return True
+
+    def _random_reference_start_upper_bound(self) -> int:
+        """Exclusive start bound that leaves a complete episode in the reference."""
+        old_eighty_percent_bound = int(self._reference_data_length * 0.8)
+        # Evaluators control their own rollout horizon and often deliberately replace the
+        # configured episode limit with a huge sentinel.  A looping reference also cannot run
+        # out.  Neither case should constrain the initial phase by the training horizon.
+        if self.is_evaluate_mode or self._loop_reference_data:
+            return old_eighty_percent_bound
+        max_speed_scale = self._max_target_velocity / self._reference_nominal_velocity
+        last_index = self._reference_data_length - 1
+        latest_full_episode_start = int(
+            np.floor(last_index - self.CUSTOM_MAX_EPISODE_STEPS * max_speed_scale)
+        )
+        upper_bound = min(old_eighty_percent_bound, latest_full_episode_start + 1)
+        if upper_bound <= 0:
+            required_frames = self.CUSTOM_MAX_EPISODE_STEPS * max_speed_scale
+            raise ValueError(
+                "Reference trajectory is too short for one full episode: "
+                f"available last index={last_index}, required phase span={required_frames:.3f}"
+            )
+        return upper_bound
 
     def _height_corrected_reference(self, data: dict) -> dict:
         """Shift the reference's pelvis height so the composed model's feet reach the ground.
@@ -359,18 +419,30 @@ class MyoAssistLegImitation(MyoAssistLegBase):
         return corrected
 
     def reset(self, **kwargs):
-        rng = np.random.default_rng()  # TODO: refactoring random to use seed
+        # Select the new episode target before reference velocities are initialised.  Previously
+        # _follow_reference_motion used the previous episode's target and the base reset changed
+        # it afterwards, leaving the initial qvel vector internally inconsistent.
+        if kwargs.get("seed") is not None:
+            self.seed(kwargs["seed"])
+        self._prepare_episode_reset()
 
         if self._flag_random_ref_index:
-            self._imitation_index = rng.integers(0, int(self._reference_data_length * 0.8))
+            start_index = int(self.np_random.integers(0, self._random_reference_start_upper_bound()))
         else:
-            self._imitation_index = 0
+            start_index = 0
+        self._set_reference_phase(float(start_index))
+        self._reference_phase_initialized = True
         # generate random targets
         # new_qpos = self.generate_qpos()# TODO: should set qvel too.
         # self.sim.data.qpos = new_qpos
         self._follow_reference_motion(False)
 
-        obs = super().reset(reset_qpos=self.sim.data.qpos, reset_qvel=self.sim.data.qvel, **kwargs)
+        obs = super().reset(
+            reset_qpos=self.sim.data.qpos.copy(),
+            reset_qvel=self.sim.data.qvel.copy(),
+            _episode_state_prepared=True,
+            **kwargs,
+        )
         return obs
 
     # override

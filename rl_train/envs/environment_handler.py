@@ -1,5 +1,6 @@
 import numpy as np
 import json
+from copy import copy
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from myosuite.utils import gym
 from rl_train.utils.data_types import DictionableDataclass
@@ -136,9 +137,9 @@ class EnvironmentHandler:
                 "or model_path to load a pre-built MJCF."
             )
 
-        # Base gym.make arguments
+        # Base gym.make arguments.  A separate seed is injected below for each worker so
+        # vectorised environments do not generate identical reference-index sequences.
         gym_make_args = {
-            "seed": config.env_params.seed,
             "model_path": model_path,
             "env_params": config.env_params,
             "is_evaluate_mode": is_evaluate_mode,
@@ -151,17 +152,28 @@ class EnvironmentHandler:
         try:
             if is_rendering_on or config.env_params.num_envs == 1:
                 print(f"{config.env_params.env_id=}")
-                env = gym.make(config.env_params.env_id, **gym_make_args).unwrapped
+                env = gym.make(config.env_params.env_id, seed=config.env_params.seed, **gym_make_args).unwrapped
                 if is_rendering_on:
                     env.mujoco_render_frames = True
                 config.env_params.num_envs = 1
                 config.ppo_params.n_steps = config.ppo_params.batch_size
             else:
+                def make_env(rank: int):
+                    def init_env():
+                        # Keep the config immutable while exposing the worker's actual seed to
+                        # the environment.  All other parameters remain identical.
+                        worker_params = copy(config.env_params)
+                        worker_params.seed = config.env_params.seed + rank
+                        return gym.make(
+                            config.env_params.env_id,
+                            seed=worker_params.seed,
+                            **{**gym_make_args, "env_params": worker_params},
+                        ).unwrapped
+
+                    return init_env
+
                 env = SubprocVecEnv(
-                    [
-                        lambda: (gym.make(config.env_params.env_id, **gym_make_args)).unwrapped
-                        for _ in range(config.env_params.num_envs)
-                    ]
+                    [make_env(rank) for rank in range(config.env_params.num_envs)]
                 )
         except Exception as e:
             new_message = str(e)[:1000]
@@ -193,21 +205,74 @@ class EnvironmentHandler:
         else:
             raise ValueError("Unsupported file format. Please use either .npz or .json.")
 
-        if "resampled_series_data" not in ref_data_dict:
-            ref_data_dict["resampled_series_data"] = {}
-            for key in ref_data_dict["series_data"].keys():
-                original_data_length = len(ref_data_dict["series_data"][key])
-                original_sample_rate = ref_data_dict["metadata"]["sample_rate"]
-                original_x = np.linspace(0, original_data_length - 1, original_data_length)
-
-                new_sample_rate = config.env_params.control_framerate
-                new_length = int(original_data_length * new_sample_rate / original_sample_rate)
-                new_x = np.linspace(0, original_data_length - 1, new_length)
-                ref_data_dict["series_data"][key] = np.interp(new_x, original_x, ref_data_dict["series_data"][key])
-                ref_data_dict["metadata"]["resampled_data_length"] = new_length
-                ref_data_dict["metadata"]["resampled_sample_rate"] = new_sample_rate
+        ref_data_dict = EnvironmentHandler.resample_reference_data(
+            ref_data_dict, new_sample_rate=config.env_params.control_framerate
+        )
 
         return ref_data_dict
+
+    @staticmethod
+    def resample_reference_data(ref_data_dict: dict, *, new_sample_rate: int) -> dict:
+        """Resample every reference channel on a physical time axis.
+
+        ``linspace(0, n - 1, new_n)`` makes the last output sample coincide with the last input
+        sample and therefore stretches the sample interval.  Here sample ``i`` always represents
+        time ``i / sample_rate``.  Position and velocity channels are interpolated independently
+        onto the same output times; the source sample-rate metadata remains unchanged and explicit
+        resampling metadata describes the arrays consumed by the environment.
+        """
+        if new_sample_rate <= 0:
+            raise ValueError(f"new_sample_rate must be positive, got {new_sample_rate}")
+        metadata = dict(ref_data_dict["metadata"])
+        raw_series = ref_data_dict["series_data"]
+        if not raw_series:
+            raise ValueError("reference series_data is empty")
+
+        lengths = {key: len(values) for key, values in raw_series.items()}
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"reference channels have inconsistent lengths: {lengths}")
+        original_length = next(iter(lengths.values()))
+        original_sample_rate = float(metadata["sample_rate"])
+        if original_length < 2 or original_sample_rate <= 0:
+            raise ValueError(
+                f"invalid reference timeline: length={original_length}, sample_rate={original_sample_rate}"
+            )
+        declared_length = metadata.get("data_length")
+        if declared_length is not None and int(declared_length) != original_length:
+            print(
+                f"Warning: reference metadata declares data_length={declared_length}, but every "
+                f"channel contains {original_length} samples; using the channel length."
+            )
+
+        original_times = np.arange(original_length, dtype=float) / original_sample_rate
+        # Include every regular output sample whose timestamp is covered by the source.
+        new_length = int(np.floor(original_times[-1] * new_sample_rate)) + 1
+        new_times = np.arange(new_length, dtype=float) / new_sample_rate
+        resampled = {
+            key: np.interp(new_times, original_times, np.asarray(values, dtype=float))
+            for key, values in raw_series.items()
+        }
+
+        metadata.update(
+            {
+                "original_data_length": original_length,
+                "original_sample_rate": original_sample_rate,
+                "original_duration_seconds": original_length / original_sample_rate,
+                "source_declared_data_length": declared_length,
+                "source_data_length_matches": declared_length is None or int(declared_length) == original_length,
+                "data_length": original_length,
+                "resampled_data_length": new_length,
+                "resampled_sample_rate": new_sample_rate,
+                "resampled_duration_seconds": new_length / new_sample_rate,
+                "resampled_last_timestamp_seconds": float(new_times[-1]),
+            }
+        )
+        result = dict(ref_data_dict)
+        result["metadata"] = metadata
+        result["series_data"] = resampled
+        # Keep the historical key truthful without duplicating the arrays in memory.
+        result["resampled_series_data"] = resampled
+        return result
 
     def get_config_type_from_session_id(session_id):
         # from rl_train.envs import myo_leg_18_reward_per_step
@@ -297,6 +362,7 @@ class EnvironmentHandler:
         else:
             ppo_kwargs = DictionableDataclass.to_dict(config.ppo_params)
             mirror_coef = ppo_kwargs.pop("mirror_coef", 0.0)
+            ppo_kwargs.setdefault("seed", config.env_params.seed)
             if mirror_coef > 0:
                 from rl_train.train.mirror_ppo import MirrorPPO
 

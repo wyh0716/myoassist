@@ -74,6 +74,9 @@ class BaseCustomLearningCallback(BaseCallback):
                     if key not in self.episode_reward_dict_sum[idx]:
                         self.episode_reward_dict_sum[idx][key] = 0
                     self.episode_reward_dict_sum[idx][key] += val
+                # Start the next episode from zero.  Without this reset, episode N's values
+                # remained in the accumulator and were counted again when episode N+1 ended.
+                self.current_reward_dict_sum[idx] = {}
 
         return True
 

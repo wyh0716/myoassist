@@ -28,6 +28,7 @@ from datetime import datetime  # noqa: E402
 from rl_train.envs.environment_handler import EnvironmentHandler  # noqa: E402
 import subprocess  # noqa: E402
 import torch  # noqa: E402
+import random  # noqa: E402
 
 # The env vars above are enough on Linux and Windows, where torch's CPU backend reads
 # OMP_NUM_THREADS at import. macOS torch does not, so set it explicitly too; both paths
@@ -53,8 +54,10 @@ VERSION = {
 
 
 def ppo_evaluate_with_rendering(config):
-    seed = 1234
+    seed = config.env_params.seed
     np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
 
     env = EnvironmentHandler.create_environment(config, is_rendering_on=True, is_evaluate_mode=True)
     model = EnvironmentHandler.get_stable_baselines3_model(config, env)
@@ -72,8 +75,10 @@ def ppo_evaluate_with_rendering(config):
 
 
 def ppo_train_with_parameters(config, train_time_step, is_rendering_on, train_log_handler):
-    seed = 1234
+    seed = config.env_params.seed
     np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
 
     env = EnvironmentHandler.create_environment(config, is_rendering_on)
     model = EnvironmentHandler.get_stable_baselines3_model(config, env)
@@ -89,10 +94,34 @@ def ppo_train_with_parameters(config, train_time_step, is_rendering_on, train_lo
 
     custom_callback = EnvironmentHandler.get_callback(config, train_log_handler)
 
-    model.learn(
-        reset_num_timesteps=False, total_timesteps=train_time_step, log_interval=1, callback=custom_callback, progress_bar=True
-    )
-    env.close()
+    final_model_path = train_log_handler.get_path2save_final_model()
+
+    def save_final_model():
+        model.save(final_model_path)
+        print(f"Final model saved to {final_model_path}.zip")
+
+    try:
+        model.learn(
+            reset_num_timesteps=False,
+            total_timesteps=train_time_step,
+            log_interval=1,
+            callback=custom_callback,
+            progress_bar=True,
+        )
+    except BaseException:
+        # Preserve the original interruption/exception even if an emergency save itself fails.
+        try:
+            save_final_model()
+        except Exception as save_error:
+            print(f"WARNING: failed to save final model during interrupted training: {save_error}")
+        finally:
+            env.close()
+        raise
+    else:
+        try:
+            save_final_model()
+        finally:
+            env.close()
     print("learning done!")
 
 

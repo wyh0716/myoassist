@@ -1,7 +1,6 @@
 import mujoco
 import numpy as np
 import os
-import json
 from rl_train.utils.train_log_handler import TrainLogHandler
 from rl_train.train.train_configs.config import TrainSessionConfigBase
 import matplotlib.pyplot as plt
@@ -488,38 +487,9 @@ class ImitationGaitEvaluator(GaitEvaluatorBase):
             self.ref_data_dict = None
             return
 
-        if self.session_config.env_params.reference_data_path.endswith(".npz"):
-            ref_data_npz = np.load(self.session_config.env_params.reference_data_path, allow_pickle=True)
-            # keys = ref_data_npz.files
-            # ref_data_dict = {key: ref_data_npz[key] for key in keys}
-            ref_data_dict = {key: ref_data_npz[key].item() for key in ref_data_npz.files}
-        elif self.session_config.env_params.reference_data_path.endswith(".json"):
-            with open(self.session_config.env_params.reference_data_path, "r") as f:
-                ref_data_dict = json.load(f)
-        else:
-            print(
-                f"Warning: Unsupported file format for {self.session_config.env_params.reference_data_path}. Please use either .npz or .json."
-            )
-            self.ref_data_dict = None
-            return
-
-        # Only process resampling if we have valid reference data
-        if ref_data_dict and "series_data" in ref_data_dict:
-            ref_data_dict["resampled_series_data"] = {}
-            for key in ref_data_dict["series_data"].keys():
-                original_data_length = len(ref_data_dict["series_data"][key])
-                original_sample_rate = ref_data_dict["metadata"]["sample_rate"]
-                original_x = np.linspace(0, original_data_length - 1, original_data_length)
-
-                new_sample_rate = self.session_config.env_params.control_framerate
-                new_length = int(original_data_length * new_sample_rate / original_sample_rate)
-                new_x = np.linspace(0, original_data_length - 1, new_length)
-                ref_data_dict["series_data"][key] = np.interp(new_x, original_x, ref_data_dict["series_data"][key])
-                # print(f"{key=} {original_data_length=} -> {new_length=} {len(ref_data_dict['series_data'][key])=}")
-                ref_data_dict["metadata"]["resampled_data_length"] = new_length
-                ref_data_dict["metadata"]["resampled_sample_rate"] = new_sample_rate
-
-        self.ref_data_dict = ref_data_dict
+        # Training and evaluation must share the same real-time resampling implementation.
+        # In particular, do not recreate the old endpoint-stretched linspace here.
+        self.ref_data_dict = EnvironmentHandler.load_reference_data(self.session_config)
         print("===============REFERENCE DATA LOADING DONE================")
 
     def initialize_env(self):

@@ -8,7 +8,6 @@ from rl_train.train.train_configs.config import TrainSessionConfigBase
 from rl_train.utils.data_types import DictionableDataclass
 import collections
 from enum import Enum
-import random
 
 
 class MyoAssistLegBase(env_base.MujocoEnv):
@@ -148,17 +147,21 @@ class MyoAssistLegBase(env_base.MujocoEnv):
             else:
                 self.sim.model.body("torso").quat = [1, 0, 0, self._lumbar_joint_fixed_angle]
 
-        # phys: 1000hz
-        # control 50hz : 50 * 20 = 1000hz
-        # ref 50hz: 500hz 10skip: 20 * 500 / 1000
-
+        if env_params.physics_sim_framerate % env_params.control_framerate != 0:
+            raise ValueError(
+                "physics_sim_framerate must be an integer multiple of control_framerate; "
+                f"got {env_params.physics_sim_framerate} Hz and {env_params.control_framerate} Hz"
+            )
         frame_skip = env_params.physics_sim_framerate // env_params.control_framerate
         original_reward_dict = DictionableDataclass.to_dict(env_params.reward_keys_and_weights)
         self.rwd_keys_wt = {}
         for key, value in original_reward_dict.items():
             if isinstance(value, dict):
-                weight_sum = sum(value.values())
-                self.rwd_keys_wt[key] = weight_sum
+                # Nested reward dictionaries contain the per-joint weights used by the
+                # imitation reward itself.  Their aggregate is already weighted there, so the
+                # dense sum must include it once with unit weight rather than multiplying it by
+                # the sum of the per-joint weights a second time.
+                self.rwd_keys_wt[key] = 1.0
             else:
                 self.rwd_keys_wt[key] = value
 
@@ -177,6 +180,12 @@ class MyoAssistLegBase(env_base.MujocoEnv):
             frame_skip=frame_skip,
             **kwargs,
         )
+        expected_control_dt = 1.0 / env_params.control_framerate
+        if not np.isclose(self.dt, expected_control_dt, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                f"MuJoCo control dt is {self.dt}, expected {expected_control_dt} from "
+                f"control_framerate={env_params.control_framerate}"
+            )
 
         # Check if the keys in DEFAULT_OBS_KEYS are in the keys of the observation dictionary
         obs_dict_keys = list(self.get_obs_dict(self.sim).keys())
@@ -399,31 +408,47 @@ class MyoAssistLegBase(env_base.MujocoEnv):
         self._max_target_velocity = max_target_velocity
 
     def _change_mode_and_target_velocity_randomly(self):
-        velocity_mode_for_this_episode = random.choice(list(MyoAssistLegBase.VelocityMode))
-        starting_phase = random.uniform(0, 2 * np.pi)
-        target_velocity_period = random.uniform(
+        velocity_modes = list(MyoAssistLegBase.VelocityMode)
+        velocity_mode_for_this_episode = velocity_modes[int(self.np_random.integers(len(velocity_modes)))]
+        starting_phase = self.np_random.uniform(0, 2 * np.pi)
+        target_velocity_period = self.np_random.uniform(
             self._min_target_velocity_period, self._max_target_velocity_period
         )  # maximum acc/dec is self._target_velocity_period / 2
         self.set_target_velocity_mode_manually(
-            velocity_mode_for_this_episode,
-            self._min_target_velocity,
-            self._min_target_velocity,
-            self._max_target_velocity,
-            starting_phase,
-            target_velocity_period,
+            mode=velocity_mode_for_this_episode,
+            starting_phase=starting_phase,
+            initial_target_velocity=self._min_target_velocity,
+            min_target_velocity=self._min_target_velocity,
+            max_target_velocity=self._max_target_velocity,
+            target_velocity_period=target_velocity_period,
         )
         if self._velocity_mode_for_this_episode == MyoAssistLegBase.VelocityMode.UNIFORM:
-            self._target_velocity = random.uniform(self._min_target_velocity, self._max_target_velocity)
+            self._target_velocity = self.np_random.uniform(self._min_target_velocity, self._max_target_velocity)
         elif self._velocity_mode_for_this_episode == MyoAssistLegBase.VelocityMode.SINUSOIDAL:
             self._target_velocity = self._calc_sinusoidal_target_velocity(
-                self._starting_phase, self._target_velocity_period, self._min_target_velocity, self._max_target_velocity
+                self._starting_phase,
+                self._target_velocity_period,
+                self._min_target_velocity,
+                self._max_target_velocity,
+                time_value=0.0,
             )
         elif self._velocity_mode_for_this_episode == MyoAssistLegBase.VelocityMode.STEP:
-            self._target_velocity = np.random.uniform(self._min_target_velocity, self._max_target_velocity)
+            self._target_velocity = self.np_random.uniform(self._min_target_velocity, self._max_target_velocity)
 
-    def _calc_sinusoidal_target_velocity(self, phase: float, period: float, min_velocity: float, max_velocity: float):
+    def _calc_sinusoidal_target_velocity(
+        self,
+        phase: float,
+        period: float,
+        min_velocity: float,
+        max_velocity: float,
+        *,
+        time_value: float | None = None,
+    ):
+        if time_value is None:
+            time_value = self.sim.data.time
         return (
-            min_velocity + (max_velocity - min_velocity) * (np.sin(phase + 2 * np.pi * self.sim.data.time / (period)) + 1) / 2
+            min_velocity
+            + (max_velocity - min_velocity) * (np.sin(phase + 2 * np.pi * time_value / period) + 1) / 2
         )
 
     def _modulate_target_velocity(self):
@@ -436,26 +461,46 @@ class MyoAssistLegBase(env_base.MujocoEnv):
             )
         elif self._velocity_mode_for_this_episode == MyoAssistLegBase.VelocityMode.STEP:
             if self.sim.data.time - self._prev_step_changed_time > self._target_velocity_period:
-                self._target_velocity = np.random.uniform(self._min_target_velocity, self._max_target_velocity)
+                self._target_velocity = self.np_random.uniform(self._min_target_velocity, self._max_target_velocity)
                 self._prev_step_changed_time = self.sim.data.time
 
-    def reset(self, **kwargs):
+    def _prepare_episode_reset(self):
+        """Choose episode state before the simulator is reset."""
         self._step_count_per_episode = 0
         if not self.is_evaluate_mode:
             self._change_mode_and_target_velocity_randomly()
-        self.sim.data.joint("pelvis_tx").qvel[0] = self._target_velocity
+        # The smoothness term compares only actions within one episode.  Keeping this history
+        # across reset would make the first reward depend on the previous episode's last action.
+        self._prev_muscle_activations_for_reward = None
 
-        self.sim.forward()
-        # sync targets to sim_obsd
-        self.robot.sync_sims(self.sim, self.sim_obsd)
-
+    def _finalize_episode_reset(self):
+        """Initialise time-dependent bookkeeping after MuJoCo is back at t=0."""
         self._reset_heel_strike_buffer()
         self._reset_reward_per_step()
         self._reset_properties_per_step()
+        self._prev_step_changed_time = self.sim.data.time
 
-        # generate resets
-        # obs = super().reset(reset_qpos= self.sim.data.qpos, reset_qvel=self.sim.data.qvel, **kwargs)
-        obs = super().reset(**kwargs)
+    def reset(self, *, _episode_state_prepared: bool = False, **kwargs):
+        # Gymnasium reset(seed=...) must control every environment-side random choice, including
+        # velocity mode and the imitation start index.  The imitation subclass prepares the
+        # episode before it installs the reference state, so avoid reseeding/preparing twice.
+        if kwargs.get("seed") is not None and not _episode_state_prepared:
+            self.seed(kwargs["seed"])
+        if not _episode_state_prepared:
+            self._prepare_episode_reset()
+
+        # Pass the target velocity into the state that the parent reset actually installs.
+        # Writing directly to sim.data before super().reset() was ineffective because the
+        # parent immediately replaced qvel with init_qvel/reset_qvel.
+        reset_qvel = kwargs.pop("reset_qvel", None)
+        reset_qvel = self.init_qvel.copy() if reset_qvel is None else np.asarray(reset_qvel).copy()
+        pelvis_dof = self.sim.model.jnt_dofadr[self.sim.model.joint("pelvis_tx").id]
+        reset_qvel[pelvis_dof] = self._target_velocity
+
+        obs = super().reset(reset_qvel=reset_qvel, **kwargs)
+        self.sim.forward()
+        self.robot.sync_sims(self.sim, self.sim_obsd)
+        self._finalize_episode_reset()
         return obs
 
     def _get_done(self):

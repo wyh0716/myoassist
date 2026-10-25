@@ -24,6 +24,9 @@ class TrainLogHandler:
     def get_path2save_model(self, num_timesteps: int):
         return os.path.join(self.model_dir, f"model_{num_timesteps}")
 
+    def get_path2save_final_model(self):
+        return os.path.join(self.model_dir, "final_model")
+
     def add_log_data(self, log_data: TrainCheckpointData):
         self.log_datas.append(log_data)
         # model.save(os.path.join(self.model_dir,f"step_{log_data.num_timesteps}"))
