@@ -1,5 +1,7 @@
 import collections
 import numpy as np
+import mujoco
+from scipy.signal import find_peaks
 from rl_train.envs.myoassist_leg_base import MyoAssistLegBase
 from rl_train.train.train_configs.config import TrainSessionConfigBase
 from rl_train.utils.data_types import DictionableDataclass
@@ -123,8 +125,33 @@ class MyoAssistLegImitation(MyoAssistLegBase):
     ):
         self._flag_random_ref_index = env_params.flag_random_ref_index
         self._out_of_trajectory_threshold = env_params.out_of_trajectory_threshold
+        self._terminate_on_trajectory_error = bool(
+            env_params.terminate_on_trajectory_error
+        )
+        self._trajectory_error_consecutive_steps = int(
+            env_params.trajectory_error_consecutive_steps
+        )
+        if self._trajectory_error_consecutive_steps < 1:
+            raise ValueError("trajectory_error_consecutive_steps must be at least one")
+        self._trajectory_error_consecutive_count = 0
         self.reference_data_keys = env_params.reference_data_keys
         self._loop_reference_data = loop_reference_data
+        self._include_future_reference_error_in_observation = bool(
+            env_params.include_future_reference_error_in_observation
+        )
+        self.future_reference_error_keys = tuple(
+            env_params.future_reference_error_keys
+        )
+        self._include_gait_phase_in_observation = bool(
+            env_params.include_gait_phase_in_observation
+        )
+        self._gait_phase_reference_key = env_params.gait_phase_reference_key
+        self._derive_gait_phase_if_missing = bool(
+            env_params.derive_gait_phase_if_missing
+        )
+        self._auto_reference_height_correction = bool(
+            env_params.auto_reference_height_correction
+        )
         self._reward_keys_and_weights: ImitationTrainSessionConfig.EnvParams.RewardWeights = env_params.reward_keys_and_weights
 
         self.setup_reference_data(data=reference_data)
@@ -134,17 +161,55 @@ class MyoAssistLegImitation(MyoAssistLegBase):
             **kwargs,
         )
 
+    def _reference_position_value(self, name: str, phase: float | None = None) -> float:
+        """Return a q reference in the V3-B local world frame."""
+        value = self._reference_value(f"q_{name}", phase=phase)
+        if name == "pelvis_tx":
+            return 0.0
+        return value
+
     def set_reward_weights(self, reward_keys_and_weights: TrainSessionConfigBase.EnvParams.RewardWeights):
         self._reward_keys_and_weights = reward_keys_and_weights
 
     # override from MujocoEnv
     def get_obs_dict(self, sim):
-        return super().get_obs_dict(sim)
+        obs_dict = super().get_obs_dict(sim)
+        if self._include_future_reference_error_in_observation:
+            obs_dict["future_reference_error"] = self._future_reference_error()
+        if self._include_gait_phase_in_observation:
+            phase = self._reference_value(self._gait_phase_reference_key)
+            obs_dict["gait_phase"] = np.asarray(
+                [np.sin(phase), np.cos(phase)], dtype=float
+            )
+        return obs_dict
+
+    def _next_control_reference_phase(self) -> float:
+        """Reference phase one policy-control interval in the future."""
+        if self._imitation_phase is None:
+            raise RuntimeError("Reference phase has not been initialised")
+        next_phase = self._imitation_phase + self._reference_speed_scale()
+        last_index = self._reference_data_length - 1
+        if self._loop_reference_data:
+            return float(next_phase % self._reference_data_length)
+        return float(min(next_phase, last_index))
+
+    def _future_reference_error(self) -> np.ndarray:
+        """q_ref(t + one control period) - q_actual(t), in fixed V3 order."""
+        future_phase = self._next_control_reference_phase()
+        errors = []
+        for name in self.future_reference_error_keys:
+            reference = self._reference_position_value(name, phase=future_phase)
+            actual = float(self.sim.data.joint(name).qpos[0])
+            errors.append(reference - actual)
+        return np.asarray(errors, dtype=float)
 
     def _get_qpos_diff(self) -> dict:
 
         def get_qpos_diff_one(key: str):
-            diff = self.sim.data.joint(f"{key}").qpos[0].copy() - self._reference_value(f"q_{key}")
+            diff = (
+                self.sim.data.joint(f"{key}").qpos[0].copy()
+                - self._reference_position_value(key)
+            )
             return diff
 
         name_diff_dict = {}
@@ -247,9 +312,11 @@ class MyoAssistLegImitation(MyoAssistLegBase):
 
     def _follow_reference_motion(self, is_x_follow: bool):
         for key in self.reference_data_keys:
-            self.sim.data.joint(f"{key}").qpos = self._reference_value(f"q_{key}")
-            if not is_x_follow and key == "pelvis_tx":
-                self.sim.data.joint(f"{key}").qpos = 0
+            if is_x_follow and key == "pelvis_tx":
+                qpos = self._reference_value(f"q_{key}")
+            else:
+                qpos = self._reference_position_value(key)
+            self.sim.data.joint(f"{key}").qpos = qpos
             # if key == 'pelvis_ty':
             #     self.sim.data.joint(f"{key}").qpos += 0.05
         speed_ratio_to_target_velocity = self._reference_speed_scale()
@@ -273,6 +340,25 @@ class MyoAssistLegImitation(MyoAssistLegBase):
 
     # override
     def step(self, a, **kwargs):
+        # Do not pass an already-corrupt state into MuJoCo.  MyoSuite otherwise catches the
+        # simulator warning and performs an internal reset, which makes the failure look like a
+        # low-pelvis fall and can return a non-finite terminal observation to PPO.
+        if not (
+            np.all(np.isfinite(self.sim.data.qpos))
+            and np.all(np.isfinite(self.sim.data.qvel))
+            and np.all(np.isfinite(self.sim.data.ctrl))
+            and np.all(np.isfinite(self.sim.data.act))
+        ):
+            terminal_observation = np.nan_to_num(
+                np.asarray(self.get_obs(), dtype=float),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            return terminal_observation, 0.0, True, False, {
+                "termination_reason": "numerical_instability",
+                "trajectory_error_exceeded": False,
+            }
         # MyoSuite calls step once from its base _setup before any public reset.  That call is
         # only a construction sanity check: do not advance the real trajectory or terminate a
         # composed device because its authored initial pose differs from reference frame zero.
@@ -283,21 +369,123 @@ class MyoAssistLegImitation(MyoAssistLegBase):
         )
 
         next_obs, reward, terminated, truncated, info = super().step(a, **kwargs)
-        if is_out_of_index:
+        info = dict(info or {})
+        numerical_failure = not (
+            np.all(np.isfinite(np.asarray(next_obs)))
+            and np.isfinite(reward)
+            and np.all(np.isfinite(self.sim.data.qpos))
+            and np.all(np.isfinite(self.sim.data.qvel))
+            and np.all(np.isfinite(self.sim.data.ctrl))
+            and np.all(np.isfinite(self.sim.data.act))
+        )
+        if numerical_failure:
+            terminated = True
+            info["termination_reason"] = "numerical_instability"
+            info["trajectory_error_exceeded"] = False
+        elif is_out_of_index:
             reward = 0
             truncated = True
+            info["termination_reason"] = "reference_exhausted"
+            info["trajectory_error_exceeded"] = False
         else:
-            q_diff_nparray: np.ndarray = self._get_qpos_diff_nparray()
-            is_out_of_trajectory = np.any(np.abs(q_diff_nparray) > self._out_of_trajectory_threshold)
-            terminated = terminated or is_out_of_trajectory
+            q_diff = self._get_qpos_diff()
+            absolute_q_diff = {key: abs(float(value)) for key, value in q_diff.items()}
+            maximum_error_joint = max(absolute_q_diff, key=absolute_q_diff.get)
+            maximum_error = absolute_q_diff[maximum_error_joint]
+            is_out_of_trajectory = maximum_error > self._out_of_trajectory_threshold
+            info.update(
+                {
+                    "trajectory_error_exceeded": bool(is_out_of_trajectory),
+                    "max_reference_position_error": float(maximum_error),
+                    "max_reference_error_joint": maximum_error_joint,
+                    "pelvis_height_m": float(self.sim.data.joint("pelvis_ty").qpos[0]),
+                    "reference_index": int(self._imitation_index),
+                }
+            )
+            if is_out_of_trajectory:
+                self._trajectory_error_consecutive_count += 1
+            else:
+                self._trajectory_error_consecutive_count = 0
+            info.update(
+                {
+                    "trajectory_error_consecutive_count": int(
+                        self._trajectory_error_consecutive_count
+                    ),
+                    "trajectory_error_consecutive_steps_required": int(
+                        self._trajectory_error_consecutive_steps
+                    ),
+                }
+            )
+
+            # A base-level fall remains immediate and takes precedence over the
+            # trajectory grace window, even if both conditions occur together.
+            if terminated:
+                pelvis_height = float(self.sim.data.joint("pelvis_ty").qpos[0])
+                # MyoSuite catches a MuJoCo NaN/Inf step and restores the simulator before
+                # returning, so the post-step arrays can already be finite again.  A base-level
+                # termination with a safe restored pelvis height is therefore a numerical
+                # failure, not a fall.
+                reason = (
+                    "pelvis_below_safe_height"
+                    if np.isfinite(pelvis_height) and pelvis_height < self._safe_height
+                    else "numerical_instability"
+                )
+                info.setdefault("termination_reason", reason)
+            elif (
+                self._terminate_on_trajectory_error
+                and self._trajectory_error_consecutive_count
+                >= self._trajectory_error_consecutive_steps
+            ):
+                terminated = True
+                info["termination_reason"] = (
+                    f"joint_out_of_trajectory:{maximum_error_joint}"
+                )
+            elif truncated:
+                info.setdefault("termination_reason", "time_limit")
 
         return (next_obs, reward, terminated, truncated, info)
 
     def setup_reference_data(self, data: dict | None):
         if data is None:
             raise ValueError("Reference data is not set")
-        self._reference_data = self._height_corrected_reference(data)
+        self._reference_data = (
+            self._height_corrected_reference(data)
+            if self._auto_reference_height_correction
+            else data
+        )
         self._reference_data_length = self._reference_data["metadata"]["resampled_data_length"]
+        series = self._reference_data["series_data"]
+        required_reference_keys = {
+            f"q_{name}" for name in self.future_reference_error_keys
+        }
+        missing_reference_keys = sorted(required_reference_keys - set(series))
+        if self._include_future_reference_error_in_observation and missing_reference_keys:
+            raise ValueError(
+                "Future-reference observation is missing NPZ channels: "
+                f"{missing_reference_keys}"
+            )
+        if self._include_gait_phase_in_observation:
+            if self._gait_phase_reference_key not in series:
+                if not self._derive_gait_phase_if_missing:
+                    raise ValueError(
+                        "Gait phase observation requires reference channel "
+                        f"{self._gait_phase_reference_key!r}"
+                    )
+                phase = self._derive_cycle_phase(series)
+                copied_reference = dict(self._reference_data)
+                copied_reference["series_data"] = dict(series)
+                copied_reference["series_data"][self._gait_phase_reference_key] = phase
+                # Historical alias used by analyzers should see the same arrays.
+                copied_reference["resampled_series_data"] = copied_reference["series_data"]
+                self._reference_data = copied_reference
+                series = self._reference_data["series_data"]
+            phase_values = np.asarray(series[self._gait_phase_reference_key], dtype=float)
+            if phase_values.shape != (self._reference_data_length,) or not np.all(
+                np.isfinite(phase_values)
+            ):
+                raise ValueError(
+                    f"Invalid {self._gait_phase_reference_key!r} reference channel"
+                )
         # MyoSuite performs one validation step inside its base _setup before the first public
         # reset.  Give that step a valid reference target; the real episode phase is selected by
         # reset immediately afterwards.
@@ -311,6 +499,32 @@ class MyoAssistLegImitation(MyoAssistLegBase):
                 "Reference mean pelvis velocity must be finite and positive; "
                 f"got {self._reference_nominal_velocity}"
             )
+
+    def _derive_cycle_phase(self, series: dict) -> np.ndarray:
+        """Derive a continuous per-stride phase from repeated right-hip peaks.
+
+        A future NPZ may provide ``gait_phase_unwrapped`` directly.  This
+        deterministic fallback keeps the V3 framework testable beforehand and
+        uses repeated gait events, never one normalization over the full file.
+        """
+        hip = np.asarray(series["q_hip_flexion_r"], dtype=float)
+        sample_rate = float(self._reference_data["metadata"]["resampled_sample_rate"])
+        peaks, _ = find_peaks(
+            hip,
+            distance=max(1, int(round(0.6 * sample_rate))),
+            prominence=max(1e-8, 0.35 * float(np.std(hip))),
+        )
+        if len(peaks) < 3:
+            raise ValueError(
+                "Could not derive gait phase from q_hip_flexion_r; provide an "
+                f"explicit {self._gait_phase_reference_key!r} NPZ channel"
+            )
+        median_period = float(np.median(np.diff(peaks)))
+        anchors = np.concatenate(
+            ([peaks[0] - median_period], peaks, [peaks[-1] + median_period])
+        )
+        anchor_phase = 2.0 * np.pi * np.arange(-1, len(peaks) + 1, dtype=float)
+        return np.interp(np.arange(len(hip), dtype=float), anchors, anchor_phase)
 
     def _reference_speed_scale(self) -> float:
         """Reference-time dilation needed for the current target walking speed."""
@@ -419,6 +633,7 @@ class MyoAssistLegImitation(MyoAssistLegBase):
         return corrected
 
     def reset(self, **kwargs):
+        self._trajectory_error_consecutive_count = 0
         # Select the new episode target before reference velocities are initialised.  Previously
         # _follow_reference_motion used the previous episode's target and the base reset changed
         # it afterwards, leaving the initial qvel vector internally inconsistent.
@@ -427,15 +642,29 @@ class MyoAssistLegImitation(MyoAssistLegBase):
         self._prepare_episode_reset()
 
         if self._flag_random_ref_index:
-            start_index = int(self.np_random.integers(0, self._random_reference_start_upper_bound()))
+            start_index = int(
+                self.np_random.integers(0, self._random_reference_start_upper_bound())
+            )
         else:
             start_index = 0
         self._set_reference_phase(float(start_index))
         self._reference_phase_initialized = True
+        # Start every episode from the complete authored keyframe before the
+        # reference overwrites pelvis/lower-limb coordinates.  Reference data
+        # has no shoulder/elbow (or device) channels, so using the current
+        # simulator arrays here used to leak those unreferenced DOFs from the
+        # constructor warm-up or the preceding episode into the next reset.
+        self.sim.data.qpos[:] = self.init_qpos
+        self.sim.data.qvel[:] = self.init_qvel
+        self.sim.data.ctrl[:] = 0.0
+        if self.sim.model.na:
+            self.sim.data.act[:] = 0.0
         # generate random targets
         # new_qpos = self.generate_qpos()# TODO: should set qvel too.
         # self.sim.data.qpos = new_qpos
         self._follow_reference_motion(False)
+        self._reset_motor_arm_state()
+        self._synchronise_polynomial_joint_equalities()
 
         obs = super().reset(
             reset_qpos=self.sim.data.qpos.copy(),
@@ -443,7 +672,60 @@ class MyoAssistLegImitation(MyoAssistLegBase):
             _episode_state_prepared=True,
             **kwargs,
         )
+        self.sim.data.ctrl[:] = 0.0
+        if self.sim.model.na:
+            self.sim.data.act[:] = 0.0
+        self._reset_motor_arm_state()
+        self._synchronise_polynomial_joint_equalities()
+        self.sim.forward()
+        self.robot.sync_sims(self.sim, self.sim_obsd)
+        reset_observation = self.get_obs()
+        if isinstance(obs, tuple):
+            obs = (reset_observation, *obs[1:])
+        else:
+            obs = reset_observation
         return obs
+
+    def _reset_motor_arm_state(self) -> None:
+        """Reset the four unreferenced arm joints to the XML-authored zero pose."""
+        arm_names = (
+            "motor_shoulder_r",
+            "motor_elbow_r",
+            "motor_shoulder_l",
+            "motor_elbow_l",
+        )
+        available = {
+            self.sim.model.joint(index).name for index in range(self.sim.model.njnt)
+        }
+        for name in arm_names:
+            if name in available:
+                self.sim.data.joint(name).qpos[0] = 0.0
+                self.sim.data.joint(name).qvel[0] = 0.0
+
+    def _synchronise_polynomial_joint_equalities(self) -> None:
+        """Make equality slave q/dq consistent with the reset master joints."""
+        model, data = self.sim.model, self.sim.data
+        for equality_id in range(model.neq):
+            if int(model.eq_type[equality_id]) != int(mujoco.mjtEq.mjEQ_JOINT):
+                continue
+            slave_id = int(model.eq_obj1id[equality_id])
+            master_id = int(model.eq_obj2id[equality_id])
+            if slave_id < 0 or master_id < 0:
+                continue
+            slave_qadr = int(model.jnt_qposadr[slave_id])
+            master_qadr = int(model.jnt_qposadr[master_id])
+            slave_dadr = int(model.jnt_dofadr[slave_id])
+            master_dadr = int(model.jnt_dofadr[master_id])
+            coefficients = np.asarray(model.eq_data[equality_id, :5], dtype=float)
+            master_delta = float(data.qpos[master_qadr] - model.qpos0[master_qadr])
+            data.qpos[slave_qadr] = model.qpos0[slave_qadr] + np.polynomial.polynomial.polyval(
+                master_delta, coefficients
+            )
+            derivative = np.polynomial.polynomial.polyval(
+                master_delta,
+                np.polynomial.polynomial.polyder(coefficients),
+            )
+            data.qvel[slave_dadr] = derivative * data.qvel[master_dadr]
 
     # override
     def _initialize_pose(self):

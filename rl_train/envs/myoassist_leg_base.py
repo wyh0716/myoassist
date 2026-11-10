@@ -66,6 +66,26 @@ class MyoAssistLegBase(env_base.MujocoEnv):
         self._max_target_velocity = env_params.max_target_velocity
         self._min_target_velocity_period = env_params.min_target_velocity_period
         self._max_target_velocity_period = env_params.max_target_velocity_period
+        self._forward_reward_mode = str(env_params.forward_reward_mode)
+        self._forward_reward_progress_weight = float(
+            env_params.forward_reward_progress_weight
+        )
+        self._forward_reward_tracking_weight = float(
+            env_params.forward_reward_tracking_weight
+        )
+        self._forward_reward_tracking_sigma = float(
+            env_params.forward_reward_tracking_sigma
+        )
+        if self._forward_reward_mode not in {
+            "legacy_exponential",
+            "progress_tracking",
+        }:
+            raise ValueError(
+                "forward_reward_mode must be 'legacy_exponential' or "
+                f"'progress_tracking'; got {self._forward_reward_mode!r}"
+            )
+        if self._forward_reward_tracking_sigma <= 0.0:
+            raise ValueError("forward_reward_tracking_sigma must be positive")
         self._change_mode_and_target_velocity_randomly()
 
         self._step_count_per_episode = 0
@@ -117,6 +137,31 @@ class MyoAssistLegBase(env_base.MujocoEnv):
         self.observation_joint_pos_keys = env_params.observation_joint_pos_keys
         self.observation_joint_vel_keys = env_params.observation_joint_vel_keys
         self.observation_joint_sensor_keys = env_params.observation_joint_sensor_keys
+        self._include_motor_arm_state_in_observation = bool(
+            env_params.include_motor_arm_state_in_observation
+        )
+        self.motor_arm_observation_joint_keys = tuple(
+            env_params.motor_arm_observation_joint_keys
+        )
+        if self._include_motor_arm_state_in_observation:
+            if len(self.motor_arm_observation_joint_keys) != 4:
+                raise ValueError(
+                    "V3 MotorArms observation requires exactly four ordered arm joints; "
+                    f"got {self.motor_arm_observation_joint_keys}"
+                )
+            missing_arm_joints = [
+                name
+                for name in self.motor_arm_observation_joint_keys
+                if name not in {
+                    self.sim.model.joint(index).name
+                    for index in range(self.sim.model.njnt)
+                }
+            ]
+            if missing_arm_joints:
+                raise ValueError(
+                    "MotorArms observation joints are absent from the model: "
+                    f"{missing_arm_joints}"
+                )
         # Joint-limit sensors: use the config list if provided, else the class default.
         self.joint_limit_sensor_keys = env_params.joint_limit_sensor_keys or self.JOINT_LIMIT_SENSOR_NAMES
 
@@ -174,8 +219,17 @@ class MyoAssistLegBase(env_base.MujocoEnv):
 
         # self.renderer = self.sim._create_renderer(self.sim)
 
+        configured_obs_keys = list(self.DEFAULT_OBS_KEYS)
+        if self._include_motor_arm_state_in_observation:
+            configured_obs_keys.extend(["arm_qpos", "arm_qvel"])
+        if getattr(self, "_include_future_reference_error_in_observation", False):
+            configured_obs_keys.append("future_reference_error")
+        if getattr(self, "_include_gait_phase_in_observation", False):
+            configured_obs_keys.append("gait_phase")
+        self._configured_obs_keys = configured_obs_keys
+
         super()._setup(
-            obs_keys=self.DEFAULT_OBS_KEYS,
+            obs_keys=self._configured_obs_keys,
             weighted_reward_keys=self.rwd_keys_wt,
             frame_skip=frame_skip,
             **kwargs,
@@ -189,8 +243,9 @@ class MyoAssistLegBase(env_base.MujocoEnv):
 
         # Check if the keys in DEFAULT_OBS_KEYS are in the keys of the observation dictionary
         obs_dict_keys = list(self.get_obs_dict(self.sim).keys())
-        assert (set(self.DEFAULT_OBS_KEYS + ["time"])) == set(obs_dict_keys), (
-            f"DEFAULT_OBS_KEYS != get_obs_dict.keys. DEFAULT_OBS_KEYS: {self.DEFAULT_OBS_KEYS}, get_obs_dict keys: {obs_dict_keys}"
+        assert (set(self._configured_obs_keys + ["time"])) == set(obs_dict_keys), (
+            f"configured obs keys != get_obs_dict.keys. configured: "
+            f"{self._configured_obs_keys}, actual: {obs_dict_keys}"
         )
         actual_reward_keys = list(self.get_reward_dict(self.sim).keys())
         assert (set(list(self.rwd_keys_wt.keys()) + ["dense", "sparse", "solved", "done"])) == set(actual_reward_keys), (
@@ -262,6 +317,22 @@ class MyoAssistLegBase(env_base.MujocoEnv):
 
         obs_dict["target_velocity"] = np.array([self._target_velocity])
 
+        if self._include_motor_arm_state_in_observation:
+            obs_dict["arm_qpos"] = np.asarray(
+                [
+                    sim.data.joint(name).qpos[0].copy()
+                    for name in self.motor_arm_observation_joint_keys
+                ],
+                dtype=float,
+            )
+            obs_dict["arm_qvel"] = np.asarray(
+                [
+                    sim.data.joint(name).qvel[0].copy()
+                    for name in self.motor_arm_observation_joint_keys
+                ],
+                dtype=float,
+            )
+
         return obs_dict
 
     def _calculate_reward_per_step(self, obs_dict, muscle_activations):
@@ -290,14 +361,35 @@ class MyoAssistLegBase(env_base.MujocoEnv):
         info = {}
         return reward_per_steps, info
 
+    def _calculate_forward_reward(self) -> float:
+        """Return one control step's forward reward, including exactly one dt."""
+        velocity = float(self.sim.data.joint("pelvis_tx").qvel[0])
+        target_velocity = float(self._target_velocity)
+        if self._forward_reward_mode == "legacy_exponential":
+            return float(
+                self.dt
+                * np.exp(-5.0 * np.square(velocity - target_velocity))
+            )
+
+        if target_velocity <= 0.0:
+            raise ValueError(
+                "progress_tracking forward reward requires a positive target velocity"
+            )
+        progress = self._forward_reward_progress_weight * np.clip(
+            velocity / target_velocity, -0.5, 1.0
+        )
+        tracking = self._forward_reward_tracking_weight * np.exp(
+            -np.square(velocity - target_velocity)
+            / np.square(self._forward_reward_tracking_sigma)
+        )
+        return float(self.dt * (progress + tracking))
+
     def _calculate_base_reward(self, obs_dict):
         model_mass = np.sum(self.sim.model.body_mass)
         # print(f"DEBUG:: model_mass: {model_mass}")
         model_weight = model_mass * 9.81  # in Newtons
 
-        forward_reward = self.dt * np.exp(
-            -5 * np.square(self.sim.data.joint("pelvis_tx").qvel[0].copy() - self._target_velocity)
-        )
+        forward_reward = self._calculate_forward_reward()
 
         muscle_activations = self._get_muscle_activation()
         # Squared, not linear. A linear cost prices a unit of activation the same wherever it

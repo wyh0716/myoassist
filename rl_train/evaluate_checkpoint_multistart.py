@@ -23,6 +23,7 @@ import numpy as np
 
 from rl_train.envs.environment_handler import EnvironmentHandler
 from rl_train.envs.myoassist_leg_base import MyoAssistLegBase
+from rl_train.envs.action_adapters import MOTOR_ARM_ACTUATORS
 from rl_train.evaluate_checkpoint_sweep import (
     _checkpoint_steps,
     _joint_metrics,
@@ -83,6 +84,13 @@ def _set_reference_start(unwrapped, index: int) -> np.ndarray:
     # would actually replay one start repeatedly.
     unwrapped._set_reference_phase(float(index))
     unwrapped._follow_reference_motion(False)
+    unwrapped.sim.data.ctrl[:] = 0.0
+    if unwrapped.sim.model.na:
+        unwrapped.sim.data.act[:] = 0.0
+    if hasattr(unwrapped, "_reset_motor_arm_state"):
+        unwrapped._reset_motor_arm_state()
+    if hasattr(unwrapped, "_synchronise_polynomial_joint_equalities"):
+        unwrapped._synchronise_polynomial_joint_equalities()
     unwrapped.sim.forward()
     unwrapped.robot.sync_sims(unwrapped.sim, unwrapped.sim_obsd)
     return unwrapped.get_obs()
@@ -149,7 +157,7 @@ def _evaluate_checkpoint(
     fps = int(config.env_params.control_framerate)
     config.env_params.num_envs = 1
     config.env_params.flag_random_ref_index = False
-    config.env_params.out_of_trajectory_threshold = 1_000_000.0
+    config.env_params.terminate_on_trajectory_error = False
     config.env_params.custom_max_episode_steps = max(1_000_000, horizon_steps + 1)
 
     seed = int(config.env_params.seed)
@@ -194,12 +202,17 @@ def _evaluate_checkpoint(
             velocity_errors = []
             heights = []
             rewards = []
+            arm_angles = []
+            arm_velocities = []
+            arm_torques = []
+            future_reference_errors = []
+            termination_reason = None
             terminated = False
             truncated = False
 
             for step in range(1, horizon_steps + 1):
                 action, _state = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, _info = env.step(action)
+                obs, reward, terminated, truncated, info = env.step(action)
                 reference_index = int(unwrapped._imitation_index)
                 simulated.append(
                     [
@@ -219,6 +232,32 @@ def _evaluate_checkpoint(
                     abs(float(unwrapped.sim.data.joint("pelvis_tx").qvel[0]) - target_velocity)
                 )
                 rewards.append(float(reward))
+                if unwrapped.sim.model.nu == 26:
+                    arm_angles.append(
+                        [
+                            float(unwrapped.sim.data.joint(name).qpos[0])
+                            for name in MOTOR_ARM_ACTUATORS
+                        ]
+                    )
+                    arm_velocities.append(
+                        [
+                            float(unwrapped.sim.data.joint(name).qvel[0])
+                            for name in MOTOR_ARM_ACTUATORS
+                        ]
+                    )
+                    arm_torques.append(
+                        [
+                            float(unwrapped.sim.data.actuator(name).force[0])
+                            * float(unwrapped.sim.model.actuator_gear[unwrapped.sim.model.actuator(name).id, 0])
+                            for name in MOTOR_ARM_ACTUATORS
+                        ]
+                    )
+                if "future_reference_error" in unwrapped.obs_dict:
+                    future_reference_errors.append(
+                        np.asarray(
+                            unwrapped.obs_dict["future_reference_error"], dtype=float
+                        ).copy()
+                    )
 
                 qdiff = {
                     name: abs(float(np.asarray(value).squeeze()))
@@ -232,6 +271,7 @@ def _evaluate_checkpoint(
                         else f"joint_out_of_trajectory:{max(qdiff, key=qdiff.get)}"
                     )
                 if terminated or truncated:
+                    termination_reason = info.get("termination_reason")
                     break
 
             sim = np.asarray(simulated, dtype=np.float64)
@@ -242,6 +282,10 @@ def _evaluate_checkpoint(
             if cycle_steps >= period_steps:
                 phase = _phase_metrics(sim[:cycle_steps], ref[:cycle_steps], period_steps)
             final_x = float(unwrapped.sim.data.joint("pelvis_tx").qpos[0])
+            arm_angles_array = np.asarray(arm_angles, dtype=np.float64)
+            arm_velocities_array = np.asarray(arm_velocities, dtype=np.float64)
+            arm_torques_array = np.asarray(arm_torques, dtype=np.float64)
+            future_error_array = np.asarray(future_reference_errors, dtype=np.float64)
             trials.append(
                 {
                     "reference_start_index": start_index,
@@ -249,6 +293,7 @@ def _evaluate_checkpoint(
                     "duration_seconds": len(sim) / fps,
                     "fell": bool(terminated),
                     "truncated": bool(truncated),
+                    "environment_termination_reason": termination_reason,
                     "strict_threshold_crossed": strict_step is not None,
                     "strict_tracking_steps": strict_step if strict_step is not None else horizon_steps,
                     "strict_tracking_seconds": (strict_step if strict_step is not None else horizon_steps) / fps,
@@ -264,6 +309,30 @@ def _evaluate_checkpoint(
                     "forward_displacement_m": final_x - initial_x,
                     "minimum_pelvis_height_m": float(np.min(heights)),
                     "mean_reward_per_step": float(np.mean(rewards)),
+                    "arm_angle_range_deg": None
+                    if arm_angles_array.size == 0
+                    else {
+                        name: [
+                            float(np.rad2deg(np.min(arm_angles_array[:, slot]))),
+                            float(np.rad2deg(np.max(arm_angles_array[:, slot]))),
+                        ]
+                        for slot, name in enumerate(MOTOR_ARM_ACTUATORS)
+                    },
+                    "arm_velocity_max_abs_rad_per_s": None
+                    if arm_velocities_array.size == 0
+                    else {
+                        name: float(np.max(np.abs(arm_velocities_array[:, slot])))
+                        for slot, name in enumerate(MOTOR_ARM_ACTUATORS)
+                    },
+                    "arm_actual_torque_max_abs_nm": None
+                    if arm_torques_array.size == 0
+                    else {
+                        name: float(np.max(np.abs(arm_torques_array[:, slot])))
+                        for slot, name in enumerate(MOTOR_ARM_ACTUATORS)
+                    },
+                    "future_reference_error_rmse": None
+                    if future_error_array.size == 0
+                    else float(np.sqrt(np.mean(np.square(future_error_array)))),
                 }
             )
 
@@ -284,10 +353,22 @@ def _evaluate_checkpoint(
                 np.mean([item["forward_velocity_mae_m_per_s"] for item in trials])
             ),
             "minimum_pelvis_height_m_min": float(np.min([item["minimum_pelvis_height_m"] for item in trials])),
+            "arm_actual_torque_max_abs_nm": None
+            if not any(item["arm_actual_torque_max_abs_nm"] for item in trials)
+            else max(
+                max(item["arm_actual_torque_max_abs_nm"].values())
+                for item in trials
+                if item["arm_actual_torque_max_abs_nm"] is not None
+            ),
         }
         return {
             "checkpoint": checkpoint.name,
             "timesteps": _checkpoint_steps(checkpoint),
+            "interface": {
+                "observation_dimension": int(env.observation_space.shape[0]),
+                "policy_action_dimension": int(env.action_space.shape[0]),
+                "physical_actuator_dimension": int(unwrapped.sim.model.nu),
+            },
             "reference_start_indices": start_indices,
             "aggregate": aggregate,
             "trials": trials,
@@ -338,7 +419,7 @@ def main() -> None:
             "control_framerate_hz": int(config.env_params.control_framerate),
             "reference_period_steps": args.reference_period_steps,
             "original_out_of_trajectory_threshold_rad": float(config.env_params.out_of_trajectory_threshold),
-            "note": "Imitation-error termination is disabled for trajectory collection; its first crossing is reconstructed. Fall termination remains enabled.",
+            "note": "Imitation-error termination is disabled through the environment flag; its first crossing is reconstructed. Fall and time/reference termination remain enabled.",
         },
         "checkpoints": results,
     }

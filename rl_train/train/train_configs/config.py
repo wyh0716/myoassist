@@ -50,10 +50,72 @@ class TrainSessionConfigBase:
         min_target_velocity_period: float = 3
         max_target_velocity_period: float = 5
 
+        # Forward-reward formulation.  The legacy mode preserves every existing
+        # experiment exactly.  ``progress_tracking`` is the V3-B formulation and
+        # returns a fully weighted, dt-scaled reward component; configs using it
+        # must therefore set reward_keys_and_weights.forward_reward to 1.0.
+        forward_reward_mode: str = "legacy_exponential"
+        forward_reward_progress_weight: float = 0.8
+        forward_reward_tracking_weight: float = 0.8
+        forward_reward_tracking_sigma: float = 0.75
+
         custom_max_episode_steps: int = 500
         model_path: str = None
         prev_trained_policy_path: str = None
         reference_data_path: str = ""
+
+        # Optional deterministic control for the four motor-only arm actuators in
+        # ``myolegs22_planar_motor_arms.xml``.  The lower-limb PPO policy always
+        # retains its original 22-muscle action space; the environment appends
+        # these four commands internally.  ``zero`` preserves the passive-arm
+        # experiments. ``contralateral_fixed20_pd`` couples each shoulder to the
+        # actual opposite hip and holds each elbow at 20 degrees.
+        motor_arms_control_mode: str = "zero"
+        motor_arms_shoulder_amplitude_deg: float = 10.0
+        motor_arms_shoulder_kp_nm_per_rad: float = 10.0
+        motor_arms_shoulder_kd_nm_s_per_rad: float = 0.5
+        motor_arms_elbow_target_deg: float = 20.0
+        motor_arms_elbow_kp_nm_per_rad: float = 6.0
+        motor_arms_elbow_kd_nm_s_per_rad: float = 0.3
+        # Optional quintic target ramp after every reset.  Zero preserves all
+        # existing checkpoints/configurations exactly.  A positive duration
+        # blends each arm target from its reset joint angle to the normal PD
+        # target with zero blend velocity at both endpoints.
+        motor_arms_pd_smooth_start_seconds: float = 0.0
+
+        # V3 MotorArms observation blocks.  They default off so every existing
+        # V1/V2 configuration retains its exact observation layout.  With all
+        # three enabled the original 44 values become 62:
+        #   44 + 4 arm q + 4 arm dq + 8 future-reference errors + sin/cos phase.
+        include_motor_arm_state_in_observation: bool = False
+        motor_arm_observation_joint_keys: list[str] = field(
+            default_factory=lambda: [
+                "motor_shoulder_r",
+                "motor_elbow_r",
+                "motor_shoulder_l",
+                "motor_elbow_l",
+            ]
+        )
+        include_future_reference_error_in_observation: bool = False
+        future_reference_error_keys: list[str] = field(
+            default_factory=lambda: [
+                "pelvis_ty",
+                "pelvis_tilt",
+                "hip_flexion_l",
+                "hip_flexion_r",
+                "knee_angle_l",
+                "knee_angle_r",
+                "ankle_angle_l",
+                "ankle_angle_r",
+            ]
+        )
+        include_gait_phase_in_observation: bool = False
+        gait_phase_reference_key: str = "gait_phase_unwrapped"
+        derive_gait_phase_if_missing: bool = True
+
+        # A reference retargeted against the final XML must not receive the
+        # legacy device-height heuristic a second time.
+        auto_reference_height_correction: bool = True
 
         enable_lumbar_joint: bool = False
         lumbar_joint_fixed_angle: float = 0.0

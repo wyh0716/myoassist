@@ -1,0 +1,185 @@
+{
+  "comment": "V3: fixed MotorArms XML + contact-constrained smooth reference, 62 observations, 22 learned muscle actions, deterministic 4-motor PD, 128x128 actor, and trajectory error retained as a diagnostic rather than a termination.",
+  "total_timesteps": 200000000,
+  "evaluate_param_list": [
+    {
+      "num_timesteps": 500,
+      "min_target_velocity": 1.25,
+      "max_target_velocity": 1.25,
+      "target_velocity_period": 2,
+      "velocity_mode": "UNIFORM",
+      "cam_type": "follow",
+      "cam_distance": 2.5,
+      "visualize_activation": true
+    }
+  ],
+  "logger_params": {
+    "logging_frequency": 8,
+    "evaluate_frequency": 0
+  },
+  "env_params": {
+    "env_id": "myoAssistLegImitation-v0",
+    "num_envs": 8,
+    "seed": 1234,
+    "safe_height": 0.7,
+    "out_of_trajectory_threshold": 0.6,
+    "terminate_on_trajectory_error": false,
+    "flag_random_ref_index": true,
+    "control_framerate": 50,
+    "physics_sim_framerate": 2000,
+    "min_target_velocity": 1.25,
+    "max_target_velocity": 1.25,
+    "min_target_velocity_period": 2,
+    "max_target_velocity_period": 10,
+    "custom_max_episode_steps": 1667,
+    "model_path": "artifacts/myolegs22_planar_motor_arms_consistent_aux_CANDIDATE.xml",
+    "msk_key": null,
+    "device_key": null,
+    "terrain": null,
+    "reference_data_path": "rl_train/reference_data/short_reference_gait_v3_contact_constrained_smooth_CANDIDATE.npz",
+    "prev_trained_policy_path": null,
+    "auto_reference_height_correction": false,
+    "motor_arms_control_mode": "contralateral_fixed20_pd",
+    "motor_arms_shoulder_amplitude_deg": 10.0,
+    "motor_arms_shoulder_kp_nm_per_rad": 10.0,
+    "motor_arms_shoulder_kd_nm_s_per_rad": 0.5,
+    "motor_arms_elbow_target_deg": 20.0,
+    "motor_arms_elbow_kp_nm_per_rad": 6.0,
+    "motor_arms_elbow_kd_nm_s_per_rad": 0.3,
+    "include_motor_arm_state_in_observation": true,
+    "motor_arm_observation_joint_keys": [
+      "motor_shoulder_r",
+      "motor_elbow_r",
+      "motor_shoulder_l",
+      "motor_elbow_l"
+    ],
+    "include_future_reference_error_in_observation": true,
+    "future_reference_error_keys": [
+      "pelvis_ty",
+      "pelvis_tilt",
+      "hip_flexion_l",
+      "hip_flexion_r",
+      "knee_angle_l",
+      "knee_angle_r",
+      "ankle_angle_l",
+      "ankle_angle_r"
+    ],
+    "include_gait_phase_in_observation": true,
+    "gait_phase_reference_key": "gait_phase_unwrapped",
+    "derive_gait_phase_if_missing": true,
+    "enable_lumbar_joint": false,
+    "lumbar_joint_fixed_angle": -0.13,
+    "lumbar_joint_damping_value": 0.05,
+    "observation_joint_pos_keys": [
+      "ankle_angle_l",
+      "ankle_angle_r",
+      "hip_flexion_l",
+      "hip_flexion_r",
+      "knee_angle_l",
+      "knee_angle_r",
+      "pelvis_tilt",
+      "pelvis_ty"
+    ],
+    "observation_joint_vel_keys": [
+      "ankle_angle_l",
+      "ankle_angle_r",
+      "hip_flexion_l",
+      "hip_flexion_r",
+      "knee_angle_l",
+      "knee_angle_r",
+      "pelvis_tilt",
+      "pelvis_tx",
+      "pelvis_ty"
+    ],
+    "observation_joint_sensor_keys": [
+      "r_foot",
+      "l_foot",
+      "r_toes",
+      "l_toes"
+    ],
+    "joint_limit_sensor_keys": [
+      "r_knee_sensor",
+      "l_knee_sensor",
+      "r_hip_sensor",
+      "l_hip_sensor",
+      "r_ankle_sensor",
+      "l_ankle_sensor",
+      "r_mtp_sensor",
+      "l_mtp_sensor"
+    ],
+    "reference_data_keys": [
+      "ankle_angle_l",
+      "ankle_angle_r",
+      "hip_flexion_l",
+      "hip_flexion_r",
+      "knee_angle_l",
+      "knee_angle_r",
+      "pelvis_tilt",
+      "pelvis_tx",
+      "pelvis_ty"
+    ],
+    "reward_keys_and_weights": {
+      "qpos_imitation_rewards": {
+        "pelvis_ty": 0.1,
+        "pelvis_tilt": 1.0,
+        "hip_flexion_l": 0.2,
+        "hip_flexion_r": 0.2,
+        "knee_angle_l": 1.0,
+        "knee_angle_r": 1.0,
+        "ankle_angle_l": 0.2,
+        "ankle_angle_r": 0.2
+      },
+      "qvel_imitation_rewards": {
+        "pelvis_ty": 0.1,
+        "pelvis_tilt": 0.1,
+        "hip_flexion_l": 0.2,
+        "hip_flexion_r": 0.2,
+        "knee_angle_l": 0.1,
+        "knee_angle_r": 0.1,
+        "ankle_angle_l": 0.1,
+        "ankle_angle_r": 0.1
+      },
+      "end_effector_imitation_reward": 0.0,
+      "forward_reward": 0.8,
+      "muscle_activation_penalty": 0.05,
+      "exo_activation_penalty": 0.0,
+      "muscle_activation_diff_penalty": 0.01,
+      "footstep_delta_time": 0.0,
+      "average_velocity_per_step": 0.0,
+      "muscle_activation_penalty_per_step": 0.0,
+      "joint_constraint_force_penalty": 0.0,
+      "foot_force_penalty": 0.01
+    }
+  },
+  "ppo_params": {
+    "learning_rate": 0.0001,
+    "n_steps": 1024,
+    "batch_size": 1024,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "clip_range_vf": 100,
+    "ent_coef": 0.001,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "use_sde": false,
+    "sde_sample_freq": -1,
+    "target_kl": 0.01,
+    "device": "cpu",
+    "mirror_coef": 0.0
+  },
+  "policy_params": {
+    "custom_policy_params": {
+      "net_arch": {
+        "human_actor": [128, 128],
+        "common_critic": [64, 64]
+      },
+      "net_indexing_info": {},
+      "log_std_init": 0.0
+    }
+  },
+  "auto_reward_adjust_params": {
+    "learning_rate": 0.0
+  }
+}

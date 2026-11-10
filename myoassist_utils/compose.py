@@ -39,6 +39,7 @@ from assist_sim import load_combined, load_msk
 from myoassist_terrains import build_terrain
 from myoassist_terrains.config import config_from_dict, load_config
 from myoassist_terrains.surface import TerrainSurface
+from myoassist_utils.motor_arms import inject_motor_arms
 
 # Seat the lowest collidable geom this far *below* the terrain surface so the
 # model opens in light contact (MuJoCo needs penetration, not just touching, to
@@ -410,6 +411,21 @@ def compose_msk_model(
     return _compose_msk_model(msk_key, terrain, export_path)
 
 
+def compose_motor_arms_model(
+    msk_key: str = "myolegs22",
+    terrain: Optional[Union[str, Path, dict]] = None,
+    export_path: Optional[Union[str, Path]] = None,
+) -> str:
+    """Compose an MSK lower body with two anatomical motor-driven arms.
+
+    The base model keeps all of its existing muscle actuators. The upper limbs
+    retain MyoSim's bone meshes and segment inertias while adding only four
+    torque motors: right/left shoulder flexion and right/left elbow flexion.
+    No arm muscle, tendon, or muscle path is retained.
+    """
+    return _compose_motor_arms_model(msk_key, terrain, export_path)
+
+
 def _compose_env_model_cached(
     msk_key: str,
     device_key: str,
@@ -502,11 +518,27 @@ def _compose_msk_model(
     )
 
 
+def _compose_motor_arms_model(
+    msk_key: str,
+    terrain: Optional[Union[str, Path, dict]],
+    export_path: Optional[Union[str, Path]],
+) -> str:
+    """Uncached implementation for :func:`compose_motor_arms_model`."""
+    return _compose_model_with_terrain(
+        lambda model_xml_path: load_msk(msk_key, export_xml=str(model_xml_path)),
+        terrain,
+        export_path,
+        assets_dir=None,
+        post_seat_transform=inject_motor_arms,
+    )
+
+
 def _compose_model_with_terrain(
     export_model_only,
     terrain: Optional[Union[str, Path, dict]],
     export_path: Optional[Union[str, Path]],
     assets_dir: Optional[Path],
+    post_seat_transform=None,
 ) -> str:
     """Layer terrain and scene settings over a caller-supplied model-only export."""
     # 1) export the model-only XML (scene stripped).
@@ -521,7 +553,6 @@ def _compose_model_with_terrain(
     # meshes are written relative to the export dir -> resolve to the (absolute,
     # persistent) install location so the temp export dir can be removed.
     _absolutize_files(model_root, model_xml_path.parent)
-
     # 2) build the terrain (flat default, a terrains JSON path, or an inline config dict).
     if terrain is None:
         cfg = _flat_default_config()
@@ -561,6 +592,11 @@ def _compose_model_with_terrain(
     #    measured from the real collision geometry at the opening pose.
     dz = _seat_dz_by_terrain(ET.tostring(model_root, encoding="unicode"), cfg, terrain_geom_names)
     _seat_model(model_root, dz)
+    # Non-colliding additions (the anatomical motor arms) must not decide how
+    # the model is seated on the terrain.  Attach them after the feet establish
+    # the root height; as children of the shifted root they inherit that shift.
+    if post_seat_transform is not None:
+        post_seat_transform(model_root)
 
     # 5) serialize.  Model meshes are now absolute install paths, so the temp
     #    export file/dir can go.

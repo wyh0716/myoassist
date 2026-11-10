@@ -14,6 +14,35 @@ from rl_train.train.train_configs.config import TrainSessionConfigBase
 _EXO_ENV_IDS = ("myoAssistLegImitationExo-v0",)
 
 
+def _apply_action_adapter(env, env_id: str, env_params):
+    """Install model-specific policy/physics action adapters.
+
+    The lower-limb policy keeps its original 22-action contract even though
+    MuJoCo has 26 physical actuators. Keep this at the environment boundary so
+    training, evaluation, single-env and vector-env execution all use exactly
+    the same configured arm controller.
+    """
+    from rl_train.envs.action_adapters import (
+        MOTOR_ARM_CONTROL_CONTRALATERAL_FIXED20_PD,
+        MOTOR_ARM_CONTROL_ZERO,
+        ContralateralFixed20MotorArmsPDWrapper,
+        ZeroMotorArmsActionWrapper,
+    )
+
+    if env_id not in _EXO_ENV_IDS and ZeroMotorArmsActionWrapper.supports(env):
+        mode = env_params.motor_arms_control_mode
+        if mode == MOTOR_ARM_CONTROL_ZERO:
+            return ZeroMotorArmsActionWrapper(env)
+        if mode == MOTOR_ARM_CONTROL_CONTRALATERAL_FIXED20_PD:
+            return ContralateralFixed20MotorArmsPDWrapper(env, env_params)
+        raise ValueError(
+            f"Unsupported motor_arms_control_mode={mode!r}; expected "
+            f"{MOTOR_ARM_CONTROL_ZERO!r} or "
+            f"{MOTOR_ARM_CONTROL_CONTRALATERAL_FIXED20_PD!r}"
+        )
+    return env
+
+
 class EnvironmentHandler:
     @staticmethod
     def _validate_action_layout(model_xml: str, config) -> None:
@@ -48,11 +77,26 @@ class EnvironmentHandler:
         env_id = config.env_params.env_id
         composed = f"env_id={env_id!r}, msk_key={config.env_params.msk_key!r}, device_key={config.env_params.device_key!r}"
 
-        if n_motor > 0 and env_id not in _EXO_ENV_IDS:
+        actuator_names = tuple(model.actuator(index).name for index in range(model.nu))
+        managed_motor_arms = bool(
+            n_muscle == 22
+            and n_motor == 4
+            and actuator_names[-4:]
+            == (
+                "motor_shoulder_r",
+                "motor_elbow_r",
+                "motor_shoulder_l",
+                "motor_elbow_l",
+            )
+            and config.env_params.motor_arms_control_mode
+            in ("zero", "contralateral_fixed20_pd")
+        )
+        if n_motor > 0 and env_id not in _EXO_ENV_IDS and not managed_motor_arms:
             raise ValueError(
                 f"Composed model has {n_motor} motor actuator(s) but {composed} selects the "
-                f"muscle-only policy, so nothing would drive them. Use an exo env id "
-                f"({', '.join(_EXO_ENV_IDS)}) or a device that adds no motor actuators."
+                "muscle-only policy without a recognized deterministic MotorArms adapter. "
+                f"Use an exo env id ({', '.join(_EXO_ENV_IDS)}), configure the exact "
+                "MotorArms layout, or use a device that adds no motor actuators."
             )
 
         # Always present (config.py CustomPolicyParams), empty for a config that does not
@@ -153,8 +197,9 @@ class EnvironmentHandler:
             if is_rendering_on or config.env_params.num_envs == 1:
                 print(f"{config.env_params.env_id=}")
                 env = gym.make(config.env_params.env_id, seed=config.env_params.seed, **gym_make_args).unwrapped
+                env = _apply_action_adapter(env, config.env_params.env_id, config.env_params)
                 if is_rendering_on:
-                    env.mujoco_render_frames = True
+                    env.unwrapped.mujoco_render_frames = True
                 config.env_params.num_envs = 1
                 config.ppo_params.n_steps = config.ppo_params.batch_size
             else:
@@ -164,11 +209,12 @@ class EnvironmentHandler:
                         # the environment.  All other parameters remain identical.
                         worker_params = copy(config.env_params)
                         worker_params.seed = config.env_params.seed + rank
-                        return gym.make(
+                        raw_env = gym.make(
                             config.env_params.env_id,
                             seed=worker_params.seed,
                             **{**gym_make_args, "env_params": worker_params},
                         ).unwrapped
+                        return _apply_action_adapter(raw_env, worker_params.env_id, worker_params)
 
                     return init_env
 
